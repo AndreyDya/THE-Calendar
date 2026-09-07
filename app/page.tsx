@@ -2,6 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabaseClient';
+import { Calendar, dateFnsLocalizer } from 'react-big-calendar';
+import { format, parse, startOfWeek, getDay } from 'date-fns';
+import { enUS } from 'date-fns/locale';
+import 'react-big-calendar/lib/css/react-big-calendar.css';
 
 type Task = {
   id: string;
@@ -11,6 +15,18 @@ type Task = {
   course_name: string | null;
   notes: string | null;
   source: string;
+  course_display_name: string | null;
+  due_at_override: string | null;
+};
+
+type CourseMapping = {
+  raw_name: string;
+  display_name: string;
+};
+
+type ViewTask = Task & {
+  effectiveDueAt: string | null;
+  effectiveCourse: string | null;
 };
 
 const currentYear = new Date().getFullYear();
@@ -20,7 +36,16 @@ const MAX_YEAR = currentYear + 5;
 const NO_SUBJECT = 'No subject';
 const NO_DATE = 'No due date';
 
-const cellBorder = '1px solid #444'; // visible on the dark theme, not just #ddd
+const cellBorder = '1px solid #444';
+
+const locales = { 'en-US': enUS };
+const localizer = dateFnsLocalizer({
+  format,
+  parse,
+  startOfWeek,
+  getDay,
+  locales,
+});
 
 function dateLabel(iso: string) {
   return new Date(iso).toLocaleDateString(undefined, {
@@ -37,6 +62,11 @@ function timeLabel(iso: string) {
   });
 }
 
+function hasSpecificTime(iso: string): boolean {
+  const d = new Date(iso);
+  return d.getHours() !== 0 || d.getMinutes() !== 0;
+}
+
 function splitIso(iso: string | null): { date: string; time: string } {
   if (!iso) return { date: '', time: '' };
   const d = new Date(iso);
@@ -46,17 +76,41 @@ function splitIso(iso: string | null): { date: string; time: string } {
   return { date, time };
 }
 
-function groupBySubject(tasks: Task[]): [string, Task[]][] {
-  const groups = new Map<string, Task[]>();
+// Effective subject, in priority order: a manual per-task override, then
+// a batch mapping keyed on the raw Canvas course code, then the raw code
+// itself if nothing's mapped it yet.
+function withEffectiveFields(tasks: Task[], mappings: Map<string, string>): ViewTask[] {
+  return tasks.map((t) => ({
+    ...t,
+    effectiveDueAt: t.due_at_override ?? t.due_at,
+    effectiveCourse:
+      t.course_display_name?.trim() ||
+      (t.course_name ? mappings.get(t.course_name) : undefined) ||
+      t.course_name?.trim() ||
+      null,
+  }));
+}
+
+function sortByEffectiveDueAt(tasks: ViewTask[]): ViewTask[] {
+  return [...tasks].sort((a, b) => {
+    if (!a.effectiveDueAt && !b.effectiveDueAt) return 0;
+    if (!a.effectiveDueAt) return 1;
+    if (!b.effectiveDueAt) return -1;
+    return new Date(a.effectiveDueAt).getTime() - new Date(b.effectiveDueAt).getTime();
+  });
+}
+
+function groupBySubject(tasks: ViewTask[]): [string, ViewTask[]][] {
+  const groups = new Map<string, ViewTask[]>();
   for (const task of tasks) {
-    const label = task.course_name?.trim() || NO_SUBJECT;
+    const label = task.effectiveCourse || NO_SUBJECT;
     if (!groups.has(label)) groups.set(label, []);
     groups.get(label)!.push(task);
   }
   const entries = Array.from(groups.entries());
   entries.sort(([, a], [, b]) => {
-    const earliestA = a.find((t) => t.due_at)?.due_at;
-    const earliestB = b.find((t) => t.due_at)?.due_at;
+    const earliestA = a.find((t) => t.effectiveDueAt)?.effectiveDueAt;
+    const earliestB = b.find((t) => t.effectiveDueAt)?.effectiveDueAt;
     if (!earliestA && !earliestB) return 0;
     if (!earliestA) return 1;
     if (!earliestB) return -1;
@@ -65,10 +119,10 @@ function groupBySubject(tasks: Task[]): [string, Task[]][] {
   return entries;
 }
 
-function groupByDate(tasks: Task[]): [string, Task[]][] {
-  const groups: [string, Task[]][] = [];
+function groupByDate(tasks: ViewTask[]): [string, ViewTask[]][] {
+  const groups: [string, ViewTask[]][] = [];
   for (const task of tasks) {
-    const label = task.due_at ? dateLabel(task.due_at) : NO_DATE;
+    const label = task.effectiveDueAt ? dateLabel(task.effectiveDueAt) : NO_DATE;
     const last = groups[groups.length - 1];
     if (last && last[0] === label) {
       last[1].push(task);
@@ -81,6 +135,10 @@ function groupByDate(tasks: Task[]): [string, Task[]][] {
 
 export default function Home() {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [mappings, setMappings] = useState<CourseMapping[]>([]);
+  const [viewMode, setViewMode] = useState<'table' | 'calendar'>('table');
+  const [showMappingPanel, setShowMappingPanel] = useState(false);
+  const [mappingDrafts, setMappingDrafts] = useState<Record<string, string>>({});
 
   const [title, setTitle] = useState('');
   const [subject, setSubject] = useState('');
@@ -89,6 +147,7 @@ export default function Home() {
   const [error, setError] = useState('');
 
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [editSource, setEditSource] = useState<string>('manual');
   const [editTitle, setEditTitle] = useState('');
   const [editSubject, setEditSubject] = useState('');
   const [editDate, setEditDate] = useState('');
@@ -98,18 +157,33 @@ export default function Home() {
   const [notesOpenId, setNotesOpenId] = useState<string | null>(null);
   const [notesDraft, setNotesDraft] = useState('');
 
+  const [calDate, setCalDate] = useState(new Date());
+  const [calView, setCalView] = useState<'month' | 'week'>('month');
+
   async function fetchTasks() {
     const { data, error } = await supabase
       .from('tasks')
-      .select('id, title, due_at, status, course_name, notes, source')
+      .select(
+        'id, title, due_at, status, course_name, notes, source, course_display_name, due_at_override'
+      )
       .order('due_at', { ascending: true, nullsFirst: false });
 
     if (error) console.error(error);
     else setTasks(data ?? []);
   }
 
+  async function fetchMappings() {
+    const { data, error } = await supabase
+      .from('course_mappings')
+      .select('raw_name, display_name');
+
+    if (error) console.error(error);
+    else setMappings(data ?? []);
+  }
+
   useEffect(() => {
     fetchTasks();
+    fetchMappings();
   }, []);
 
   function buildDueAtIso(
@@ -169,11 +243,12 @@ export default function Home() {
     else fetchTasks();
   }
 
-  function startEdit(task: Task) {
+  function startEdit(task: ViewTask) {
     setEditingId(task.id);
+    setEditSource(task.source);
     setEditTitle(task.title);
-    setEditSubject(task.course_name ?? '');
-    const { date, time } = splitIso(task.due_at);
+    setEditSubject(task.effectiveCourse ?? '');
+    const { date, time } = splitIso(task.effectiveDueAt);
     setEditDate(date);
     setEditTime(time);
     setEditError('');
@@ -189,14 +264,12 @@ export default function Home() {
     const { iso, ok } = buildDueAtIso(editDate, editTime, setEditError);
     if (!ok) return;
 
-    const { error } = await supabase
-      .from('tasks')
-      .update({
-        title: editTitle,
-        course_name: editSubject.trim() || null,
-        due_at: iso,
-      })
-      .eq('id', id);
+    const payload =
+      editSource === 'canvas'
+        ? { course_display_name: editSubject.trim() || null, due_at_override: iso }
+        : { title: editTitle, course_name: editSubject.trim() || null, due_at: iso };
+
+    const { error } = await supabase.from('tasks').update(payload).eq('id', id);
 
     if (error) {
       console.error(error);
@@ -226,8 +299,67 @@ export default function Home() {
     else fetchTasks();
   }
 
-  const grouped = groupBySubject(tasks);
+  function openMappingPanel() {
+    const drafts: Record<string, string> = {};
+    for (const rawName of rawCanvasCourses) {
+      const existing = mappings.find((m) => m.raw_name === rawName);
+      drafts[rawName] = existing?.display_name ?? '';
+    }
+    setMappingDrafts(drafts);
+    setShowMappingPanel(true);
+  }
+
+  async function saveMappings() {
+    const rows = Object.entries(mappingDrafts)
+      .filter(([, displayName]) => displayName.trim())
+      .map(([rawName, displayName]) => ({
+        raw_name: rawName,
+        display_name: displayName.trim(),
+      }));
+
+    if (rows.length === 0) {
+      setShowMappingPanel(false);
+      return;
+    }
+
+    const { error } = await supabase
+      .from('course_mappings')
+      .upsert(rows, { onConflict: 'raw_name' });
+
+    if (error) {
+      console.error(error);
+      return;
+    }
+
+    setShowMappingPanel(false);
+    fetchMappings();
+  }
+
+  const mappingsMap = new Map(mappings.map((m) => [m.raw_name, m.display_name]));
+  const viewTasks = sortByEffectiveDueAt(withEffectiveFields(tasks, mappingsMap));
+  const grouped = groupBySubject(viewTasks);
   const notesTask = tasks.find((t) => t.id === notesOpenId);
+
+  // Every distinct raw Canvas course code currently in your tasks — this
+  // is what the mapping panel lets you assign friendly names to, once
+  // each, regardless of how many tasks share that code.
+  const rawCanvasCourses = Array.from(
+    new Set(
+      tasks
+        .filter((t) => t.source === 'canvas' && t.course_name)
+        .map((t) => t.course_name as string)
+    )
+  ).sort();
+
+  const calendarEvents = viewTasks
+    .filter((t) => t.effectiveDueAt)
+    .map((t) => ({
+      id: t.id,
+      title: t.effectiveCourse ? `${t.title} (${t.effectiveCourse})` : t.title,
+      start: new Date(t.effectiveDueAt!),
+      end: new Date(t.effectiveDueAt!),
+      resource: t,
+    }));
 
   return (
     <main style={{ padding: 40, paddingRight: 320 }}>
@@ -268,139 +400,221 @@ export default function Home() {
         </p>
       )}
 
-      {grouped.map(([subjectLabel, subjectTasks]) => (
+      <div style={{ marginBottom: 20 }}>
+        <button
+          onClick={() => setViewMode('table')}
+          style={{ fontWeight: viewMode === 'table' ? 'bold' : 'normal' }}
+        >
+          Table view
+        </button>{' '}
+        <button
+          onClick={() => setViewMode('calendar')}
+          style={{ fontWeight: viewMode === 'calendar' ? 'bold' : 'normal' }}
+        >
+          Calendar view
+        </button>{' '}
+        <button onClick={openMappingPanel}>Manage subject names</button>
+      </div>
+
+      {showMappingPanel && (
         <div
-          key={subjectLabel}
           style={{
-            marginBottom: 36,
-            paddingBottom: 12,
-            borderBottom: '2px solid #666', // stronger break between subjects
+            marginBottom: 24,
+            padding: 16,
+            border: '1px solid #666',
+            borderRadius: 8,
           }}
         >
-          <h3 style={{ marginBottom: 8 }}>{subjectLabel}</h3>
-          <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-            <tbody>
-              {groupByDate(subjectTasks).map(([label, dateTasks]) =>
-                dateTasks.map((t, i) => {
-                  const locked = t.source === 'canvas';
-                  const isEditing = editingId === t.id;
+          <p style={{ marginTop: 0 }}>
+            Assign a friendly name to each raw Canvas course code. This applies to every
+            task under that code — now and after future syncs — until you change it again.
+          </p>
+          {rawCanvasCourses.length === 0 && <p>No Canvas-synced tasks yet.</p>}
+          {rawCanvasCourses.map((rawName) => (
+            <div key={rawName} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+              <span style={{ opacity: 0.7, minWidth: 220 }}>{rawName}</span>
+              <input
+                value={mappingDrafts[rawName] ?? ''}
+                onChange={(e) =>
+                  setMappingDrafts((prev) => ({ ...prev, [rawName]: e.target.value }))
+                }
+                placeholder="e.g. ECE 145"
+              />
+            </div>
+          ))}
+          <button onClick={saveMappings}>Save</button>{' '}
+          <button onClick={() => setShowMappingPanel(false)}>Cancel</button>
+        </div>
+      )}
 
-                  return (
-                    <tr key={t.id}>
-                      {i === 0 && (
+      {viewMode === 'table' ? (
+        grouped.map(([subjectLabel, subjectTasks]) => (
+          <div
+            key={subjectLabel}
+            style={{
+              marginBottom: 36,
+              paddingBottom: 12,
+              borderBottom: '2px solid #666',
+            }}
+          >
+            <h3 style={{ marginBottom: 8 }}>{subjectLabel}</h3>
+            <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+              <tbody>
+                {groupByDate(subjectTasks).map(([label, dateTasks]) =>
+                  dateTasks.map((t, i) => {
+                    const isCanvas = t.source === 'canvas';
+                    const isEditing = editingId === t.id;
+
+                    return (
+                      <tr key={t.id}>
+                        {i === 0 && (
+                          <td
+                            rowSpan={dateTasks.length}
+                            style={{
+                              verticalAlign: 'top',
+                              padding: '8px 16px 8px 0',
+                              whiteSpace: 'nowrap',
+                              fontWeight: 500,
+                              borderBottom: cellBorder,
+                              borderTop: cellBorder,
+                            }}
+                          >
+                            {label}
+                          </td>
+                        )}
+
                         <td
-                          rowSpan={dateTasks.length}
                           style={{
-                            verticalAlign: 'top',
-                            padding: '8px 16px 8px 0',
-                            whiteSpace: 'nowrap',
-                            fontWeight: 500,
+                            padding: '8px 16px',
+                            width: '100%',
                             borderBottom: cellBorder,
                             borderTop: cellBorder,
                           }}
                         >
-                          {label}
-                        </td>
-                      )}
-
-                      <td
-                        style={{
-                          padding: '8px 16px',
-                          width: '100%',
-                          borderBottom: cellBorder,
-                          borderTop: cellBorder,
-                        }}
-                      >
-                        {isEditing ? (
-                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                            <input
-                              value={editTitle}
-                              onChange={(e) => setEditTitle(e.target.value)}
-                            />
-                            <input
-                              value={editSubject}
-                              onChange={(e) => setEditSubject(e.target.value)}
-                              placeholder="Subject"
-                            />
-                            <div>
+                          {isEditing ? (
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                              {isCanvas ? (
+                                <span style={{ opacity: 0.7 }}>
+                                  {editTitle} <em>(title set by Canvas — not editable)</em>
+                                </span>
+                              ) : (
+                                <input
+                                  value={editTitle}
+                                  onChange={(e) => setEditTitle(e.target.value)}
+                                />
+                              )}
                               <input
-                                type="date"
-                                value={editDate}
-                                onChange={(e) => setEditDate(e.target.value)}
+                                value={editSubject}
+                                onChange={(e) => setEditSubject(e.target.value)}
+                                placeholder="Subject"
                               />
-                              <input
-                                type="time"
-                                value={editTime}
-                                onChange={(e) => setEditTime(e.target.value)}
-                                disabled={!editDate}
-                              />
+                              <div>
+                                <input
+                                  type="date"
+                                  value={editDate}
+                                  onChange={(e) => setEditDate(e.target.value)}
+                                />
+                                <input
+                                  type="time"
+                                  value={editTime}
+                                  onChange={(e) => setEditTime(e.target.value)}
+                                  disabled={!editDate}
+                                />
+                              </div>
+                              {editError && (
+                                <p style={{ color: 'crimson', margin: 0 }}>{editError}</p>
+                              )}
                             </div>
-                            {editError && (
-                              <p style={{ color: 'crimson', margin: 0 }}>{editError}</p>
-                            )}
-                          </div>
-                        ) : (
-                          <>
-                            <span
-                              onClick={() => toggleComplete(t.id, t.status)}
-                              style={{
-                                cursor: 'pointer',
-                                textDecoration: t.status === 'done' ? 'line-through' : 'none',
-                              }}
-                            >
-                              {t.title}
-                            </span>
-                            {t.due_at && (
-                              <span style={{ opacity: 0.7 }}> — {timeLabel(t.due_at)}</span>
-                            )}
-                            <button
-                              onClick={() => openNotes(t)}
-                              title={t.notes ? 'View/edit notes' : 'Add a note'}
-                              style={{
-                                marginLeft: 8,
-                                fontWeight: t.notes ? 'bold' : 'normal',
-                              }}
-                            >
-                              📝
-                            </button>
-                          </>
-                        )}
-                      </td>
+                          ) : (
+                            <>
+                              <span
+                                onClick={() => toggleComplete(t.id, t.status)}
+                                style={{
+                                  cursor: 'pointer',
+                                  textDecoration: t.status === 'done' ? 'line-through' : 'none',
+                                }}
+                              >
+                                {t.title}
+                              </span>
+                              {t.effectiveDueAt && hasSpecificTime(t.effectiveDueAt) && (
+                                <span style={{ opacity: 0.7 }}>
+                                  {' '}
+                                  — {timeLabel(t.effectiveDueAt)}
+                                </span>
+                              )}
+                              <button
+                                onClick={() => openNotes(t)}
+                                title={t.notes ? 'View/edit notes' : 'Add a note'}
+                                style={{
+                                  marginLeft: 8,
+                                  fontWeight: t.notes ? 'bold' : 'normal',
+                                }}
+                              >
+                                📝
+                              </button>
+                            </>
+                          )}
+                        </td>
 
-                      <td
-                        style={{
-                          padding: '8px 0',
-                          whiteSpace: 'nowrap',
-                          borderBottom: cellBorder,
-                          borderTop: cellBorder,
-                        }}
-                      >
-                        {isEditing ? (
-                          <>
-                            <button onClick={() => saveEdit(t.id)}>Save</button>{' '}
-                            <button onClick={cancelEdit}>Cancel</button>
-                          </>
-                        ) : (
-                          <>
-                            <button
-                              onClick={() => startEdit(t)}
-                              disabled={locked}
-                              title={locked ? "Synced from Canvas — can't edit" : undefined}
-                            >
-                              Edit
-                            </button>{' '}
-                            <button onClick={() => deleteTask(t.id)}>Delete</button>
-                          </>
-                        )}
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
+                        <td
+                          style={{
+                            padding: '8px 0',
+                            whiteSpace: 'nowrap',
+                            borderBottom: cellBorder,
+                            borderTop: cellBorder,
+                          }}
+                        >
+                          {isEditing ? (
+                            <>
+                              <button onClick={() => saveEdit(t.id)}>Save</button>{' '}
+                              <button onClick={cancelEdit}>Cancel</button>
+                            </>
+                          ) : (
+                            <>
+                              <button onClick={() => startEdit(t)}>Edit</button>{' '}
+                              <button onClick={() => deleteTask(t.id)}>Delete</button>
+                            </>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
+        ))
+      ) : (
+        <div
+          style={{
+            background: 'white',
+            color: '#111',
+            colorScheme: 'light',
+            padding: 16,
+            borderRadius: 8,
+          }}
+        >
+          <Calendar
+            localizer={localizer}
+            events={calendarEvents}
+            startAccessor="start"
+            endAccessor="end"
+            views={['month', 'week']}
+            style={{ height: 750 }}
+            popup
+            date={calDate}
+            view={calView}
+            onNavigate={(newDate) => setCalDate(newDate)}
+            onView={(newView) => setCalView(newView as 'month' | 'week')}
+            onSelectEvent={(event) => openNotes(event.resource)}
+            components={{
+              // Native browser tooltip on hover — shows the full title
+              // even when the event bar itself truncates it visually.
+              event: ({ event }) => <span title={event.title}>{event.title}</span>,
+            }}
+          />
         </div>
-      ))}
+      )}
 
       {notesTask && (
         <div
@@ -413,8 +627,8 @@ export default function Home() {
             border: '1px solid #ccc',
             borderRadius: 8,
             background: 'white',
-            color: '#111', // explicit dark text, independent of the page's dark theme
-            colorScheme: 'light', // forces native form controls to render light-mode
+            color: '#111',
+            colorScheme: 'light',
             boxShadow: '0 2px 8px rgba(0,0,0,0.3)',
           }}
         >
@@ -422,6 +636,28 @@ export default function Home() {
             <strong>{notesTask.title}</strong>
             <button onClick={closeNotes}>×</button>
           </div>
+
+          {(() => {
+            const vt = viewTasks.find((v) => v.id === notesTask.id);
+            if (!vt) return null;
+            return (
+              <div style={{ marginBottom: 12, fontSize: 14 }}>
+                {vt.effectiveCourse && <div>Subject: {vt.effectiveCourse}</div>}
+                <div>
+                  Due:{' '}
+                  {vt.effectiveDueAt
+                    ? `${dateLabel(vt.effectiveDueAt)}${
+                        hasSpecificTime(vt.effectiveDueAt)
+                          ? `, ${timeLabel(vt.effectiveDueAt)}`
+                          : ''
+                      }`
+                    : 'No due date'}
+                </div>
+                <div>Status: {vt.status}</div>
+              </div>
+            );
+          })()}
+
           <textarea
             value={notesDraft}
             onChange={(e) => setNotesDraft(e.target.value)}
