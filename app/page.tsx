@@ -94,8 +94,10 @@ function withEffectiveFields(tasks: Task[], mappings: Map<string, string>): View
 function sortByEffectiveDueAt(tasks: ViewTask[]): ViewTask[] {
   return [...tasks].sort((a, b) => {
     if (!a.effectiveDueAt && !b.effectiveDueAt) return 0;
-    if (!a.effectiveDueAt) return 1;
-    if (!b.effectiveDueAt) return -1;
+    // Undated tasks sort first, not last — this is what puts "No due
+    // date" at the top of every table/date-group instead of the bottom.
+    if (!a.effectiveDueAt) return -1;
+    if (!b.effectiveDueAt) return 1;
     return new Date(a.effectiveDueAt).getTime() - new Date(b.effectiveDueAt).getTime();
   });
 }
@@ -136,12 +138,14 @@ function groupByDate(tasks: ViewTask[]): [string, ViewTask[]][] {
 export default function Home() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [mappings, setMappings] = useState<CourseMapping[]>([]);
-  const [viewMode, setViewMode] = useState<'table' | 'calendar'>('table');
+  const [viewMode, setViewMode] = useState<'table' | 'calendar' | 'completed'>('table');
+  const [groupMode, setGroupMode] = useState<'subject' | 'date'>('date');
   const [showMappingPanel, setShowMappingPanel] = useState(false);
   const [mappingDrafts, setMappingDrafts] = useState<Record<string, string>>({});
 
   const [title, setTitle] = useState('');
   const [subject, setSubject] = useState('');
+  const [subjectMode, setSubjectMode] = useState<'select' | 'new'>('select');
   const [dueDate, setDueDate] = useState('');
   const [dueTime, setDueTime] = useState('');
   const [error, setError] = useState('');
@@ -150,6 +154,7 @@ export default function Home() {
   const [editSource, setEditSource] = useState<string>('manual');
   const [editTitle, setEditTitle] = useState('');
   const [editSubject, setEditSubject] = useState('');
+  const [editSubjectMode, setEditSubjectMode] = useState<'select' | 'new'>('select');
   const [editDate, setEditDate] = useState('');
   const [editTime, setEditTime] = useState('');
   const [editError, setEditError] = useState('');
@@ -166,6 +171,7 @@ export default function Home() {
       .select(
         'id, title, due_at, status, course_name, notes, source, course_display_name, due_at_override'
       )
+      .eq('dismissed', false)
       .order('due_at', { ascending: true, nullsFirst: false });
 
     if (error) console.error(error);
@@ -222,6 +228,7 @@ export default function Home() {
 
     setTitle('');
     setSubject('');
+    setSubjectMode('select');
     setDueDate('');
     setDueTime('');
     fetchTasks();
@@ -237,8 +244,23 @@ export default function Home() {
     else fetchTasks();
   }
 
-  async function deleteTask(id: string) {
-    const { error } = await supabase.from('tasks').delete().eq('id', id);
+  // Canvas tasks are never hard-deleted — the next sync would just see
+  // "this Canvas assignment isn't in my table" and re-insert it. Instead,
+  // a "dismissed" flag hides it from view, and sync (which never writes
+  // that column) can't undo the dismissal. Manual tasks have no such
+  // conflict, so they're still genuinely deleted.
+  async function deleteTask(task: ViewTask) {
+    if (task.source === 'canvas') {
+      const { error } = await supabase
+        .from('tasks')
+        .update({ dismissed: true })
+        .eq('id', task.id);
+      if (error) console.error(error);
+      else fetchTasks();
+      return;
+    }
+
+    const { error } = await supabase.from('tasks').delete().eq('id', task.id);
     if (error) console.error(error);
     else fetchTasks();
   }
@@ -248,6 +270,7 @@ export default function Home() {
     setEditSource(task.source);
     setEditTitle(task.title);
     setEditSubject(task.effectiveCourse ?? '');
+    setEditSubjectMode('select');
     const { date, time } = splitIso(task.effectiveDueAt);
     setEditDate(date);
     setEditTime(time);
@@ -337,7 +360,30 @@ export default function Home() {
 
   const mappingsMap = new Map(mappings.map((m) => [m.raw_name, m.display_name]));
   const viewTasks = sortByEffectiveDueAt(withEffectiveFields(tasks, mappingsMap));
-  const grouped = groupBySubject(viewTasks);
+
+  // Every distinct subject name currently in use, across both manual
+  // entries and Canvas mappings — this is what populates the subject
+  // dropdown so retyping isn't necessary (and typos can't quietly split
+  // one subject into two).
+  const existingSubjects = Array.from(
+    new Set(viewTasks.map((t) => t.effectiveCourse).filter((s): s is string => !!s))
+  ).sort();
+
+  // Completed tasks get pulled out of the main table/calendar entirely,
+  // so the primary view only ever shows what's still actually pending —
+  // done items live in their own tab instead of sitting struck-through
+  // in the middle of everything else.
+  const pendingTasks = viewTasks.filter((t) => t.status !== 'done');
+  const completedTasks = viewTasks.filter((t) => t.status === 'done');
+
+  // Which grouping sits on the outside (section headings) versus inside
+  // (the row-span column) is exactly reversed between the two modes —
+  // everything else about the table is identical either way.
+  const subGroupFn = groupMode === 'subject' ? groupByDate : groupBySubject;
+  const grouped =
+    groupMode === 'subject' ? groupBySubject(pendingTasks) : groupByDate(pendingTasks);
+  const groupedCompleted =
+    groupMode === 'subject' ? groupBySubject(completedTasks) : groupByDate(completedTasks);
   const notesTask = tasks.find((t) => t.id === notesOpenId);
 
   // Every distinct raw Canvas course code currently in your tasks — this
@@ -351,7 +397,7 @@ export default function Home() {
     )
   ).sort();
 
-  const calendarEvents = viewTasks
+  const calendarEvents = pendingTasks
     .filter((t) => t.effectiveDueAt)
     .map((t) => ({
       id: t.id,
@@ -360,6 +406,221 @@ export default function Home() {
       end: new Date(t.effectiveDueAt!),
       resource: t,
     }));
+
+  // Renders a two-level grouped table — the outer level becomes section
+  // headings, the inner level becomes the row-spanning left column. Which
+  // function does which job is what makes "group by subject" and "group
+  // by date" the same rendering code with the roles swapped.
+  // Shared subject picker for both the Add form and inline editing — a
+  // dropdown of existing subjects, with "Add new" swapping in a text
+  // input for a genuinely new one. Same component either way; only the
+  // value/mode state passed in differs.
+  function renderSubjectPicker(
+    value: string,
+    setValue: (v: string) => void,
+    mode: 'select' | 'new',
+    setMode: (m: 'select' | 'new') => void,
+    placeholder: string
+  ) {
+    if (mode === 'new') {
+      return (
+        <span style={{ display: 'inline-flex', gap: 4 }}>
+          <input
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            placeholder="New subject name"
+            autoFocus
+          />
+          <button
+            type="button"
+            title="Choose an existing subject instead"
+            onClick={() => {
+              setMode('select');
+              setValue('');
+            }}
+          >
+            ↩
+          </button>
+        </span>
+      );
+    }
+
+    return (
+      <select
+        value={value}
+        onChange={(e) => {
+          if (e.target.value === '__new__') {
+            setMode('new');
+            setValue('');
+          } else {
+            setValue(e.target.value);
+          }
+        }}
+        // Unlike the surrounding text inputs, <select> doesn't reliably
+        // inherit the page's dark color-scheme on its own — this is what
+        // was causing the light-grey-on-white contrast issue.
+        style={{ colorScheme: 'dark' }}
+      >
+        <option value="" style={{ background: '#1e1e1e', color: 'white' }}>
+          {placeholder}
+        </option>
+        {existingSubjects.map((s) => (
+          <option key={s} value={s} style={{ background: '#1e1e1e', color: 'white' }}>
+            {s}
+          </option>
+        ))}
+        <option value="__new__" style={{ background: '#1e1e1e', color: 'white' }}>
+          + Add new subject…
+        </option>
+      </select>
+    );
+  }
+
+  function renderGroupedTable(
+    outerGroups: [string, ViewTask[]][],
+    innerGroupFn: (tasks: ViewTask[]) => [string, ViewTask[]][]
+  ) {
+    return outerGroups.map(([outerLabel, outerTasks]) => (
+      <div
+        key={outerLabel}
+        style={{
+          marginBottom: 36,
+          paddingBottom: 12,
+          borderBottom: '2px solid #666',
+        }}
+      >
+        <h3 style={{ marginBottom: 8 }}>{outerLabel}</h3>
+        <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+          <tbody>
+            {innerGroupFn(outerTasks).map(([label, dateTasks]) =>
+              dateTasks.map((t, i) => {
+                const isCanvas = t.source === 'canvas';
+                const isEditing = editingId === t.id;
+
+                return (
+                  <tr key={t.id}>
+                    {i === 0 && (
+                      <td
+                        rowSpan={dateTasks.length}
+                        style={{
+                          verticalAlign: 'top',
+                          padding: '8px 16px 8px 0',
+                          whiteSpace: 'nowrap',
+                          fontWeight: 500,
+                          borderBottom: cellBorder,
+                          borderTop: cellBorder,
+                        }}
+                      >
+                        {label}
+                      </td>
+                    )}
+
+                    <td
+                      style={{
+                        padding: '8px 16px',
+                        width: '100%',
+                        borderBottom: cellBorder,
+                        borderTop: cellBorder,
+                      }}
+                    >
+                      {isEditing ? (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                          {isCanvas ? (
+                            <span style={{ opacity: 0.7 }}>
+                              {editTitle} <em>(title set by Canvas — not editable)</em>
+                            </span>
+                          ) : (
+                            <input
+                              value={editTitle}
+                              onChange={(e) => setEditTitle(e.target.value)}
+                            />
+                          )}
+                          {renderSubjectPicker(
+                            editSubject,
+                            setEditSubject,
+                            editSubjectMode,
+                            setEditSubjectMode,
+                            'Subject'
+                          )}
+                          <div>
+                            <input
+                              type="date"
+                              value={editDate}
+                              onChange={(e) => setEditDate(e.target.value)}
+                            />
+                            <input
+                              type="time"
+                              value={editTime}
+                              onChange={(e) => setEditTime(e.target.value)}
+                              disabled={!editDate}
+                            />
+                          </div>
+                          {editError && (
+                            <p style={{ color: 'crimson', margin: 0 }}>{editError}</p>
+                          )}
+                        </div>
+                      ) : (
+                        <>
+                          <span
+                            onClick={() => toggleComplete(t.id, t.status)}
+                            style={{
+                              cursor: 'pointer',
+                              textDecoration: t.status === 'done' ? 'line-through' : 'none',
+                            }}
+                          >
+                            {t.title}
+                          </span>
+                          {t.effectiveDueAt && hasSpecificTime(t.effectiveDueAt) && (
+                            <span style={{ opacity: 0.7 }}>
+                              {' '}
+                              — {timeLabel(t.effectiveDueAt)}
+                            </span>
+                          )}
+                          <button
+                            onClick={() => openNotes(t)}
+                            title={t.notes ? 'View/edit notes' : 'Add a note'}
+                            style={{
+                              marginLeft: 8,
+                              fontWeight: t.notes ? 'bold' : 'normal',
+                            }}
+                          >
+                            📝
+                          </button>
+                        </>
+                      )}
+                    </td>
+
+                    <td
+                      style={{
+                        padding: '8px 0',
+                        whiteSpace: 'nowrap',
+                        borderBottom: cellBorder,
+                        borderTop: cellBorder,
+                      }}
+                    >
+                      {isEditing ? (
+                        <>
+                          <button onClick={() => saveEdit(t.id)}>Save</button>{' '}
+                          <button onClick={cancelEdit}>Cancel</button>
+                        </>
+                      ) : (
+                        <>
+                          <button onClick={() => startEdit(t)}>Edit</button>{' '}
+                          <button onClick={() => deleteTask(t)}>
+                            {isCanvas ? 'Dismiss' : 'Delete'}
+                          </button>
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+    ));
+  }
 
   return (
     <main style={{ padding: 40, paddingRight: 320 }}>
@@ -372,11 +633,7 @@ export default function Home() {
           onKeyDown={(e) => e.key === 'Enter' && addTask()}
           placeholder="New task"
         />
-        <input
-          value={subject}
-          onChange={(e) => setSubject(e.target.value)}
-          placeholder="Subject (optional)"
-        />
+        {renderSubjectPicker(subject, setSubject, subjectMode, setSubjectMode, 'Subject (optional)')}
         <input
           type="date"
           value={dueDate}
@@ -413,7 +670,30 @@ export default function Home() {
         >
           Calendar view
         </button>{' '}
-        <button onClick={openMappingPanel}>Manage subject names</button>
+        <button
+          onClick={() => setViewMode('completed')}
+          style={{ fontWeight: viewMode === 'completed' ? 'bold' : 'normal' }}
+        >
+          Completed
+        </button>{' '}
+        <button onClick={openMappingPanel}>Manage subject names</button>{' '}
+        {viewMode !== 'calendar' && (
+          <>
+            |{' '}
+            <button
+              onClick={() => setGroupMode('subject')}
+              style={{ fontWeight: groupMode === 'subject' ? 'bold' : 'normal' }}
+            >
+              Group by subject
+            </button>{' '}
+            <button
+              onClick={() => setGroupMode('date')}
+              style={{ fontWeight: groupMode === 'date' ? 'bold' : 'normal' }}
+            >
+              Group by date
+            </button>
+          </>
+        )}
       </div>
 
       {showMappingPanel && (
@@ -447,144 +727,17 @@ export default function Home() {
         </div>
       )}
 
-      {viewMode === 'table' ? (
-        grouped.map(([subjectLabel, subjectTasks]) => (
-          <div
-            key={subjectLabel}
-            style={{
-              marginBottom: 36,
-              paddingBottom: 12,
-              borderBottom: '2px solid #666',
-            }}
-          >
-            <h3 style={{ marginBottom: 8 }}>{subjectLabel}</h3>
-            <table style={{ borderCollapse: 'collapse', width: '100%' }}>
-              <tbody>
-                {groupByDate(subjectTasks).map(([label, dateTasks]) =>
-                  dateTasks.map((t, i) => {
-                    const isCanvas = t.source === 'canvas';
-                    const isEditing = editingId === t.id;
+      {viewMode === 'table' && renderGroupedTable(grouped, subGroupFn)}
 
-                    return (
-                      <tr key={t.id}>
-                        {i === 0 && (
-                          <td
-                            rowSpan={dateTasks.length}
-                            style={{
-                              verticalAlign: 'top',
-                              padding: '8px 16px 8px 0',
-                              whiteSpace: 'nowrap',
-                              fontWeight: 500,
-                              borderBottom: cellBorder,
-                              borderTop: cellBorder,
-                            }}
-                          >
-                            {label}
-                          </td>
-                        )}
+      {viewMode === 'completed' && (
+        completedTasks.length === 0 ? (
+          <p style={{ opacity: 0.7 }}>Nothing completed yet.</p>
+        ) : (
+          renderGroupedTable(groupedCompleted, subGroupFn)
+        )
+      )}
 
-                        <td
-                          style={{
-                            padding: '8px 16px',
-                            width: '100%',
-                            borderBottom: cellBorder,
-                            borderTop: cellBorder,
-                          }}
-                        >
-                          {isEditing ? (
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                              {isCanvas ? (
-                                <span style={{ opacity: 0.7 }}>
-                                  {editTitle} <em>(title set by Canvas — not editable)</em>
-                                </span>
-                              ) : (
-                                <input
-                                  value={editTitle}
-                                  onChange={(e) => setEditTitle(e.target.value)}
-                                />
-                              )}
-                              <input
-                                value={editSubject}
-                                onChange={(e) => setEditSubject(e.target.value)}
-                                placeholder="Subject"
-                              />
-                              <div>
-                                <input
-                                  type="date"
-                                  value={editDate}
-                                  onChange={(e) => setEditDate(e.target.value)}
-                                />
-                                <input
-                                  type="time"
-                                  value={editTime}
-                                  onChange={(e) => setEditTime(e.target.value)}
-                                  disabled={!editDate}
-                                />
-                              </div>
-                              {editError && (
-                                <p style={{ color: 'crimson', margin: 0 }}>{editError}</p>
-                              )}
-                            </div>
-                          ) : (
-                            <>
-                              <span
-                                onClick={() => toggleComplete(t.id, t.status)}
-                                style={{
-                                  cursor: 'pointer',
-                                  textDecoration: t.status === 'done' ? 'line-through' : 'none',
-                                }}
-                              >
-                                {t.title}
-                              </span>
-                              {t.effectiveDueAt && hasSpecificTime(t.effectiveDueAt) && (
-                                <span style={{ opacity: 0.7 }}>
-                                  {' '}
-                                  — {timeLabel(t.effectiveDueAt)}
-                                </span>
-                              )}
-                              <button
-                                onClick={() => openNotes(t)}
-                                title={t.notes ? 'View/edit notes' : 'Add a note'}
-                                style={{
-                                  marginLeft: 8,
-                                  fontWeight: t.notes ? 'bold' : 'normal',
-                                }}
-                              >
-                                📝
-                              </button>
-                            </>
-                          )}
-                        </td>
-
-                        <td
-                          style={{
-                            padding: '8px 0',
-                            whiteSpace: 'nowrap',
-                            borderBottom: cellBorder,
-                            borderTop: cellBorder,
-                          }}
-                        >
-                          {isEditing ? (
-                            <>
-                              <button onClick={() => saveEdit(t.id)}>Save</button>{' '}
-                              <button onClick={cancelEdit}>Cancel</button>
-                            </>
-                          ) : (
-                            <>
-                              <button onClick={() => startEdit(t)}>Edit</button>{' '}
-                              <button onClick={() => deleteTask(t.id)}>Delete</button>
-                            </>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
-        ))
-      ) : (
+      {viewMode === 'calendar' && (
         <div
           style={{
             background: 'white',
