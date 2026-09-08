@@ -604,13 +604,15 @@ export default function Home() {
             popup
             date={calDate}
             view={calView}
-            onNavigate={(newDate) => setCalDate(newDate)}
-            onView={(newView) => setCalView(newView as 'month' | 'week')}
-            onSelectEvent={(event) => openNotes(event.resource)}
+            onNavigate={(newDate: Date) => setCalDate(newDate)}
+            onView={(newView: string) => setCalView(newView as 'month' | 'week')}
+            onSelectEvent={(event: { resource: Task }) => openNotes(event.resource)}
             components={{
               // Native browser tooltip on hover — shows the full title
               // even when the event bar itself truncates it visually.
-              event: ({ event }) => <span title={event.title}>{event.title}</span>,
+              event: ({ event }: { event: { title: string } }) => (
+                <span title={event.title}>{event.title}</span>
+              ),
             }}
           />
         </div>
