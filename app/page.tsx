@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { supabase } from '@/lib/supabaseClient';
 import { Calendar, dateFnsLocalizer } from 'react-big-calendar';
-import { format, parse, startOfWeek, getDay } from 'date-fns';
+import { format, parse, startOfWeek as dateFnsStartOfWeek, getDay } from 'date-fns';
 import { enUS } from 'date-fns/locale';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 
@@ -39,6 +39,10 @@ const NO_DATE = 'No due date';
 const cellBorder = '1px solid #444';
 
 const locales = { 'en-US': enUS };
+// Monday-start week (weekStartsOn: 1) — date-fns/enUS defaults to Sunday
+// (weekStartsOn: 0), which is what this overrides.
+const startOfWeek = (date: Date) => dateFnsStartOfWeek(date, { weekStartsOn: 1 });
+
 const localizer = dateFnsLocalizer({
   format,
   parse,
@@ -142,6 +146,8 @@ export default function Home() {
   const [groupMode, setGroupMode] = useState<'subject' | 'date'>('date');
   const [showMappingPanel, setShowMappingPanel] = useState(false);
   const [mappingDrafts, setMappingDrafts] = useState<Record<string, string>>({});
+  const [webAssignStatus, setWebAssignStatus] = useState('');
+  const [lastWebAssignImport, setLastWebAssignImport] = useState<string | null>(null);
 
   const [title, setTitle] = useState('');
   const [subject, setSubject] = useState('');
@@ -187,9 +193,21 @@ export default function Home() {
     else setMappings(data ?? []);
   }
 
+  async function fetchLastWebAssignImport() {
+    const { data, error } = await supabase
+      .from('app_settings')
+      .select('value')
+      .eq('key', 'last_webassign_import')
+      .maybeSingle();
+
+    if (error) console.error(error);
+    else setLastWebAssignImport(data?.value ?? null);
+  }
+
   useEffect(() => {
     fetchTasks();
     fetchMappings();
+    fetchLastWebAssignImport();
   }, []);
 
   function buildDueAtIso(
@@ -250,7 +268,9 @@ export default function Home() {
   // that column) can't undo the dismissal. Manual tasks have no such
   // conflict, so they're still genuinely deleted.
   async function deleteTask(task: ViewTask) {
-    if (task.source === 'canvas') {
+    // Any non-manual source gets dismissed rather than deleted — the
+    // next sync/import would just re-add a hard-deleted row otherwise.
+    if (task.source !== 'manual') {
       const { error } = await supabase
         .from('tasks')
         .update({ dismissed: true })
@@ -288,7 +308,7 @@ export default function Home() {
     if (!ok) return;
 
     const payload =
-      editSource === 'canvas'
+      editSource !== 'manual'
         ? { course_display_name: editSubject.trim() || null, due_at_override: iso }
         : { title: editTitle, course_name: editSubject.trim() || null, due_at: iso };
 
@@ -324,7 +344,7 @@ export default function Home() {
 
   function openMappingPanel() {
     const drafts: Record<string, string> = {};
-    for (const rawName of rawCanvasCourses) {
+    for (const rawName of rawSyncedCourses) {
       const existing = mappings.find((m) => m.raw_name === rawName);
       drafts[rawName] = existing?.display_name ?? '';
     }
@@ -358,6 +378,41 @@ export default function Home() {
     fetchMappings();
   }
 
+  async function importWebAssignFile(file: File) {
+    setWebAssignStatus('Importing…');
+
+    try {
+      const text = await file.text();
+      const res = await fetch('/api/import-webassign', { method: 'POST', body: text });
+
+      if (!res.ok) {
+        // The route errored badly enough that it didn't even return its
+        // own JSON error shape (e.g. a 404 because the file isn't at the
+        // right path, or an unhandled server crash) — read as text so we
+        // can show *something* instead of throwing on res.json().
+        const text = await res.text();
+        console.error('WebAssign import HTTP error:', res.status, text);
+        setWebAssignStatus(`Import failed (HTTP ${res.status}) — check the console.`);
+        return;
+      }
+
+      const json = await res.json();
+
+      if (!json.success) {
+        console.error(json.error);
+        setWebAssignStatus(`Import failed: ${json.error}`);
+        return;
+      }
+
+      setWebAssignStatus(`Imported/updated ${json.upserted} WebAssign task(s).`);
+      fetchTasks();
+      fetchLastWebAssignImport();
+    } catch (err) {
+      console.error('WebAssign import threw:', err);
+      setWebAssignStatus('Import failed unexpectedly — check the console.');
+    }
+  }
+
   const mappingsMap = new Map(mappings.map((m) => [m.raw_name, m.display_name]));
   const viewTasks = sortByEffectiveDueAt(withEffectiveFields(tasks, mappingsMap));
 
@@ -389,10 +444,10 @@ export default function Home() {
   // Every distinct raw Canvas course code currently in your tasks — this
   // is what the mapping panel lets you assign friendly names to, once
   // each, regardless of how many tasks share that code.
-  const rawCanvasCourses = Array.from(
+  const rawSyncedCourses = Array.from(
     new Set(
       tasks
-        .filter((t) => t.source === 'canvas' && t.course_name)
+        .filter((t) => t.source !== 'manual' && t.course_name)
         .map((t) => t.course_name as string)
     )
   ).sort();
@@ -406,6 +461,14 @@ export default function Home() {
       end: new Date(t.effectiveDueAt!),
       resource: t,
     }));
+
+  // A week is the threshold for "stale" — matches the once-a-week check-in
+  // habit for WebAssign, since nothing watches it automatically.
+  const STALE_DAYS = 7;
+  const daysSinceWebAssignImport = lastWebAssignImport
+    ? Math.floor((Date.now() - new Date(lastWebAssignImport).getTime()) / (1000 * 60 * 60 * 24))
+    : null;
+  const webAssignIsStale = daysSinceWebAssignImport === null || daysSinceWebAssignImport >= STALE_DAYS;
 
   // Renders a two-level grouped table — the outer level becomes section
   // headings, the inner level becomes the row-spanning left column. Which
@@ -494,7 +557,7 @@ export default function Home() {
           <tbody>
             {innerGroupFn(outerTasks).map(([label, dateTasks]) =>
               dateTasks.map((t, i) => {
-                const isCanvas = t.source === 'canvas';
+                const isSynced = t.source !== 'manual';
                 const isEditing = editingId === t.id;
 
                 return (
@@ -525,9 +588,9 @@ export default function Home() {
                     >
                       {isEditing ? (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                          {isCanvas ? (
+                          {isSynced ? (
                             <span style={{ opacity: 0.7 }}>
-                              {editTitle} <em>(title set by Canvas — not editable)</em>
+                              {editTitle} <em>(title set by sync — not editable)</em>
                             </span>
                           ) : (
                             <input
@@ -607,7 +670,7 @@ export default function Home() {
                         <>
                           <button onClick={() => startEdit(t)}>Edit</button>{' '}
                           <button onClick={() => deleteTask(t)}>
-                            {isCanvas ? 'Dismiss' : 'Delete'}
+                            {isSynced ? 'Dismiss' : 'Delete'}
                           </button>
                         </>
                       )}
@@ -625,6 +688,22 @@ export default function Home() {
   return (
     <main style={{ padding: 40, paddingRight: 320 }}>
       <h1>Tasks</h1>
+
+      {webAssignIsStale && (
+        <p
+          style={{
+            background: '#4a3a00',
+            border: '1px solid #a67c00',
+            padding: '8px 12px',
+            borderRadius: 6,
+            marginBottom: 20,
+          }}
+        >
+          {lastWebAssignImport
+            ? `It's been ${daysSinceWebAssignImport} days since your last WebAssign import — worth checking for new assignments.`
+            : "You haven't imported a WebAssign calendar yet."}
+        </p>
+      )}
 
       <div style={{ marginBottom: 20 }}>
         <input
@@ -677,6 +756,21 @@ export default function Home() {
           Completed
         </button>{' '}
         <button onClick={openMappingPanel}>Manage subject names</button>{' '}
+        <label style={{ cursor: 'pointer', border: '1px solid #666', padding: '4px 8px', borderRadius: 4 }}>
+          Import WebAssign .ics
+          <input
+            type="file"
+            accept=".ics"
+            style={{ display: 'none' }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) importWebAssignFile(file);
+              e.target.value = ''; // allows re-selecting the same file later
+            }}
+          />
+        </label>
+        {webAssignStatus && <span style={{ marginLeft: 8, opacity: 0.8 }}>{webAssignStatus}</span>}
+        {' '}
         {viewMode !== 'calendar' && (
           <>
             |{' '}
@@ -706,11 +800,12 @@ export default function Home() {
           }}
         >
           <p style={{ marginTop: 0 }}>
-            Assign a friendly name to each raw Canvas course code. This applies to every
+            Assign a friendly name to each raw synced course label (from Canvas or
+            WebAssign). This applies to every
             task under that code — now and after future syncs — until you change it again.
           </p>
-          {rawCanvasCourses.length === 0 && <p>No Canvas-synced tasks yet.</p>}
-          {rawCanvasCourses.map((rawName) => (
+          {rawSyncedCourses.length === 0 && <p>No synced tasks yet.</p>}
+          {rawSyncedCourses.map((rawName) => (
             <div key={rawName} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
               <span style={{ opacity: 0.7, minWidth: 220 }}>{rawName}</span>
               <input
