@@ -1,0 +1,237 @@
+/* Layout and responsive rules for the task app.
+   Imported from page.tsx, so globals.css doesn't need to change.
+   Colors use semi-transparent grays so they read fine in light and dark. */
+
+.muted {
+  opacity: 0.7;
+}
+
+/* ---- Page frame ---------------------------------------------------- */
+
+/* The right padding reserves the gutter the notes panel sits in. */
+.app-main {
+  padding: 40px 320px 40px 40px;
+}
+
+/* ---- Add-task form -------------------------------------------------- */
+
+.task-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+/* Only used on phones, where the form is collapsed behind it. */
+.add-toggle {
+  display: none;
+}
+
+/* ---- Toolbars -------------------------------------------------------- */
+
+.toolbar-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.tools {
+  margin-bottom: 20px;
+}
+
+.tools summary {
+  cursor: pointer;
+  opacity: 0.8;
+  margin-bottom: 8px;
+}
+
+.file-button {
+  display: inline-block;
+  cursor: pointer;
+  border: 1px solid rgba(128, 128, 128, 0.6);
+  border-radius: 4px;
+  padding: 4px 10px;
+}
+
+/* ---- Tables ----------------------------------------------------------- */
+
+.table-scroll {
+  overflow-x: auto;
+}
+
+/* ---- Notes panel -------------------------------------------------------- */
+
+.notes-panel {
+  position: fixed;
+  top: 40px;
+  right: 20px;
+  width: 260px;
+  z-index: 50;
+}
+
+/* ---- Day summary box ---------------------------------------------------- */
+
+.summary-box {
+  border: 1px solid rgba(128, 128, 128, 0.45);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 20px;
+}
+
+.summary-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.summary-title {
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  line-height: 1.25;
+}
+
+.summary-counts {
+  margin-left: auto;
+}
+
+.summary-body {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 12px;
+}
+
+.summary-body h4 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.7;
+}
+
+.summary-body p {
+  margin: 0;
+}
+
+.summary-subhead {
+  font-size: 12px;
+  opacity: 0.7;
+  margin: 6px 0 4px !important;
+}
+
+.summary-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.summary-task {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.summary-event {
+  display: flex;
+  gap: 10px;
+}
+
+.summary-time {
+  min-width: 96px;
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: rgba(128, 128, 128, 0.6);
+}
+
+/* ---- Phones -------------------------------------------------------------- */
+
+@media (max-width: 640px) {
+  .app-main {
+    padding: 16px;
+  }
+
+  /* Comfortable touch targets, and 16px text so mobile browsers don't
+     zoom the page when a field is focused. */
+  button,
+  select,
+  input:not([type='checkbox']),
+  textarea {
+    font-size: 16px;
+    min-height: 40px;
+  }
+
+  input[type='checkbox'] {
+    width: 20px;
+    height: 20px;
+  }
+
+  /* The add form is collapsed behind a "+ Add task" button. */
+  .add-toggle {
+    display: block;
+    width: 100%;
+    margin-bottom: 12px;
+  }
+
+  .task-form {
+    display: none;
+  }
+
+  .task-form.open {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .task-form > * {
+    width: 100%;
+  }
+
+  .summary-body {
+    grid-template-columns: 1fr;
+  }
+
+  .summary-counts {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  /* The notes panel stops being a right-hand sidebar (which would eat a
+     huge share of a phone's width) and becomes a bottom sheet. */
+  .notes-panel {
+    top: auto;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    width: 100%;
+    max-height: 60vh;
+    overflow-y: auto;
+    border-radius: 12px 12px 0 0 !important;
+    box-sizing: border-box;
+  }
+
+  /* react-big-calendar sets its height inline, which beats a normal
+     stylesheet rule, hence !important. 750px is taller than most phones. */
+  .rbc-calendar {
+    height: 500px !important;
+  }
+}

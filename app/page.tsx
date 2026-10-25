@@ -6,6 +6,7 @@ import { Calendar, dateFnsLocalizer } from 'react-big-calendar';
 import { format, parse, startOfWeek as dateFnsStartOfWeek, getDay } from 'date-fns';
 import { enUS } from 'date-fns/locale';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
+import './responsive.css';
 
 type Task = {
   id: string;
@@ -27,6 +28,18 @@ type CourseMapping = {
 type ViewTask = Task & {
   effectiveDueAt: string | null;
   effectiveCourse: string | null;
+};
+
+// A calendar event (from Google Calendar). Unlike a task it has a start AND
+// an end, and nothing to complete or dismiss — which is why it lives in its
+// own table instead of `tasks`.
+type EventRow = {
+  id: string;
+  title: string;
+  start_at: string;
+  end_at: string;
+  all_day: boolean;
+  location: string | null;
 };
 
 const currentYear = new Date().getFullYear();
@@ -69,6 +82,43 @@ function timeLabel(iso: string) {
 function hasSpecificTime(iso: string): boolean {
   const d = new Date(iso);
   return d.getHours() !== 0 || d.getMinutes() !== 0;
+}
+
+function startOfLocalDay(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function addDays(d: Date, n: number): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+}
+
+function sameLocalDay(a: Date, b: Date): boolean {
+  return startOfLocalDay(a).getTime() === startOfLocalDay(b).getTime();
+}
+
+// Timed events are real instants and convert straight to local time. All-day
+// events have no time or timezone — the server stores them as UTC midnights
+// that stand for a calendar date — so we read the date back with the UTC
+// getters and rebuild it as local midnight. (End is exclusive, as in iCal.)
+function eventLocalRange(e: EventRow): { start: Date; end: Date } {
+  if (e.all_day) {
+    const s = new Date(e.start_at);
+    const en = new Date(e.end_at);
+    return {
+      start: new Date(s.getUTCFullYear(), s.getUTCMonth(), s.getUTCDate()),
+      end: new Date(en.getUTCFullYear(), en.getUTCMonth(), en.getUTCDate()),
+    };
+  }
+  return { start: new Date(e.start_at), end: new Date(e.end_at) };
+}
+
+function eventOverlapsDay(range: { start: Date; end: Date }, day: Date): boolean {
+  const dayStart = startOfLocalDay(day).getTime();
+  const dayEnd = addDays(startOfLocalDay(day), 1).getTime();
+  const start = range.start.getTime();
+  const end = range.end.getTime();
+  if (end <= start) return start >= dayStart && start < dayEnd; // zero-length
+  return start < dayEnd && end > dayStart;
 }
 
 function splitIso(iso: string | null): { date: string; time: string } {
@@ -149,6 +199,17 @@ export default function Home() {
   const [webAssignStatus, setWebAssignStatus] = useState('');
   const [lastWebAssignImport, setLastWebAssignImport] = useState<string | null>(null);
 
+  const [events, setEvents] = useState<EventRow[]>([]);
+  const [lastGoogleSync, setLastGoogleSync] = useState<string | null>(null);
+  const [googleStatus, setGoogleStatus] = useState('');
+  const [calFilter, setCalFilter] = useState<'both' | 'assignments' | 'events'>('both');
+
+  // null until the page is running in the browser, so the server-rendered
+  // HTML never contains a date (server and browser timezones can differ).
+  const [summaryDate, setSummaryDate] = useState<Date | null>(null);
+  const [summaryOpen, setSummaryOpen] = useState(true);
+  const [showAddForm, setShowAddForm] = useState(false);
+
   const [title, setTitle] = useState('');
   const [subject, setSubject] = useState('');
   const [subjectMode, setSubjectMode] = useState<'select' | 'new'>('select');
@@ -204,10 +265,81 @@ export default function Home() {
     else setLastWebAssignImport(data?.value ?? null);
   }
 
+  async function fetchEvents() {
+    const { data, error } = await supabase
+      .from('events')
+      .select('id, title, start_at, end_at, all_day, location')
+      .order('start_at', { ascending: true });
+
+    if (error) {
+      console.warn('Could not load events (has the events table been created?):', error.message);
+    } else {
+      setEvents(data ?? []);
+    }
+  }
+
+  async function fetchLastGoogleSync(): Promise<string | null> {
+    const { data, error } = await supabase
+      .from('app_settings')
+      .select('value')
+      .eq('key', 'last_google_sync')
+      .maybeSingle();
+
+    if (error) {
+      console.warn(error.message);
+      return null;
+    }
+    setLastGoogleSync(data?.value ?? null);
+    return data?.value ?? null;
+  }
+
+  async function syncGoogle() {
+    setGoogleStatus('Syncing calendar…');
+    try {
+      const res = await fetch('/api/sync-google');
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok || !json?.success) {
+        console.warn('Google sync failed:', json?.error ?? res.status);
+        setGoogleStatus(
+          json?.error === 'GOOGLE_ICS_URL is not set'
+            ? 'Calendar not connected yet.'
+            : 'Calendar sync failed.'
+        );
+        return;
+      }
+
+      setGoogleStatus('');
+      await fetchEvents();
+      await fetchLastGoogleSync();
+    } catch (err) {
+      console.warn('Google sync threw:', err);
+      setGoogleStatus('Calendar sync failed.');
+    }
+  }
+
+  // Sync on open: the daily cron alone would leave "today's schedule" up to a
+  // day out of date, so opening the app also refreshes when the last sync is
+  // older than 15 minutes.
+  async function maybeSyncGoogle() {
+    const last = await fetchLastGoogleSync();
+    const stale = !last || Date.now() - new Date(last).getTime() > 15 * 60 * 1000;
+    if (stale) await syncGoogle();
+  }
+
   useEffect(() => {
     fetchTasks();
     fetchMappings();
     fetchLastWebAssignImport();
+    fetchEvents();
+    maybeSyncGoogle();
+
+    setSummaryDate(startOfLocalDay(new Date()));
+    try {
+      if (window.localStorage.getItem('summaryOpen') === 'false') setSummaryOpen(false);
+    } catch {
+      // storage can be unavailable (private mode etc.) — default stays open
+    }
   }, []);
 
   function buildDueAtIso(
@@ -247,6 +379,7 @@ export default function Home() {
     setTitle('');
     setSubject('');
     setSubjectMode('select');
+    setShowAddForm(false);
     setDueDate('');
     setDueTime('');
     fetchTasks();
@@ -452,15 +585,35 @@ export default function Home() {
     )
   ).sort();
 
-  const calendarEvents = pendingTasks
+  const taskCalendarItems = pendingTasks
     .filter((t) => t.effectiveDueAt)
     .map((t) => ({
       id: t.id,
+      kind: 'task' as const,
       title: t.effectiveCourse ? `${t.title} (${t.effectiveCourse})` : t.title,
       start: new Date(t.effectiveDueAt!),
       end: new Date(t.effectiveDueAt!),
+      allDay: false,
       resource: t,
     }));
+
+  const googleCalendarItems = events.map((e) => {
+    const range = eventLocalRange(e);
+    return {
+      id: e.id,
+      kind: 'event' as const,
+      title: e.title,
+      start: range.start,
+      end: range.end,
+      allDay: e.all_day,
+      resource: e,
+    };
+  });
+
+  const calendarEvents = [
+    ...(calFilter !== 'events' ? taskCalendarItems : []),
+    ...(calFilter !== 'assignments' ? googleCalendarItems : []),
+  ];
 
   // A week is the threshold for "stale" — matches the once-a-week check-in
   // habit for WebAssign, since nothing watches it automatically.
@@ -469,6 +622,189 @@ export default function Home() {
     ? Math.floor((Date.now() - new Date(lastWebAssignImport).getTime()) / (1000 * 60 * 60 * 24))
     : null;
   const webAssignIsStale = daysSinceWebAssignImport === null || daysSinceWebAssignImport >= STALE_DAYS;
+
+  // --- Day summary box ---------------------------------------------------
+  // Everything below is recomputed from the same `tasks` and `events` state
+  // the rest of the page uses, on every render. The box never keeps its own
+  // copy, so ticking a task off anywhere updates it everywhere.
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  const todayStart = startOfLocalDay(new Date());
+  const dayOffset = summaryDate
+    ? Math.round((summaryDate.getTime() - todayStart.getTime()) / MS_PER_DAY)
+    : 0;
+
+  const summaryEvents = summaryDate
+    ? events
+        .map((e) => ({ e, range: eventLocalRange(e) }))
+        .filter(({ range }) => eventOverlapsDay(range, summaryDate))
+        .sort((a, b) => {
+          if (a.e.all_day !== b.e.all_day) return a.e.all_day ? -1 : 1;
+          return a.range.start.getTime() - b.range.start.getTime();
+        })
+    : [];
+
+  const summaryDue = summaryDate
+    ? pendingTasks.filter(
+        (t) => t.effectiveDueAt && sameLocalDay(new Date(t.effectiveDueAt), summaryDate)
+      )
+    : [];
+
+  // Overdue is only meaningful relative to the real today, so it only shows
+  // while you're looking at today. A task due today is not overdue yet, even
+  // with no set time: it becomes overdue once its date has passed.
+  const summaryOverdue =
+    summaryDate && dayOffset === 0
+      ? pendingTasks.filter(
+          (t) =>
+            t.effectiveDueAt &&
+            startOfLocalDay(new Date(t.effectiveDueAt)).getTime() < todayStart.getTime()
+        )
+      : [];
+
+  function shiftSummary(days: number) {
+    setSummaryDate((d) => (d ? addDays(d, days) : d));
+  }
+
+  function goToToday() {
+    setSummaryDate(startOfLocalDay(new Date()));
+  }
+
+  function toggleSummary() {
+    const next = !summaryOpen;
+    setSummaryOpen(next);
+    try {
+      window.localStorage.setItem('summaryOpen', String(next));
+    } catch {
+      // not fatal — it just won't be remembered
+    }
+  }
+
+  function renderSummaryTask(t: ViewTask, showDate: boolean) {
+    const meta = [
+      showDate && t.effectiveDueAt
+        ? new Date(t.effectiveDueAt).toLocaleDateString(undefined, {
+            month: 'short',
+            day: 'numeric',
+          })
+        : null,
+      t.effectiveCourse,
+      t.effectiveDueAt && hasSpecificTime(t.effectiveDueAt) ? timeLabel(t.effectiveDueAt) : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
+
+    return (
+      <li key={t.id} className="summary-task">
+        <input
+          type="checkbox"
+          checked={false}
+          onChange={() => toggleComplete(t.id, t.status)}
+          aria-label={`Mark ${t.title} done`}
+        />
+        <button className="link-button" onClick={() => openNotes(t)}>
+          {t.title}
+        </button>
+        {meta && <span className="muted">{meta}</span>}
+      </li>
+    );
+  }
+
+  function renderSummaryBox() {
+    if (!summaryDate) return null;
+    const day = summaryDate;
+    const label =
+      dayOffset === 0
+        ? 'Today'
+        : dayOffset === 1
+          ? 'Tomorrow'
+          : dayOffset === -1
+            ? 'Yesterday'
+            : day.toLocaleDateString(undefined, { weekday: 'long' });
+    const dateText = day.toLocaleDateString(undefined, {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+    const todoCount = summaryOverdue.length + summaryDue.length;
+    const calendarConnected = lastGoogleSync !== null || events.length > 0;
+
+    return (
+      <section className="summary-box">
+        <div className="summary-header">
+          <button onClick={() => shiftSummary(-1)} aria-label="Previous day">
+            ‹
+          </button>
+          <div className="summary-title">
+            <strong>{label}</strong>
+            <span className="muted">{dateText}</span>
+          </div>
+          <button onClick={() => shiftSummary(1)} aria-label="Next day">
+            ›
+          </button>
+          {dayOffset !== 0 && <button onClick={goToToday}>Today</button>}
+          <span className="summary-counts muted">
+            {summaryEvents.length} event{summaryEvents.length === 1 ? '' : 's'} · {todoCount} to do
+          </span>
+          <button onClick={toggleSummary}>{summaryOpen ? 'Hide' : 'Show'}</button>
+        </div>
+
+        {summaryOpen && (
+          <div className="summary-body">
+            <div>
+              <h4>Schedule</h4>
+              {!calendarConnected ? (
+                <p className="muted">{googleStatus || 'Calendar not connected yet.'}</p>
+              ) : summaryEvents.length === 0 ? (
+                <p className="muted">Nothing scheduled.</p>
+              ) : (
+                <ul className="summary-list">
+                  {summaryEvents.map(({ e }) => (
+                    <li key={e.id} className="summary-event">
+                      <span className="summary-time">
+                        {e.all_day
+                          ? 'All day'
+                          : `${timeLabel(e.start_at)}–${timeLabel(e.end_at)}`}
+                      </span>
+                      <span>
+                        {e.title}
+                        {e.location && <span className="muted"> · {e.location}</span>}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+
+            <div>
+              <h4>To do</h4>
+              {todoCount === 0 ? (
+                <p className="muted">Nothing due.</p>
+              ) : (
+                <>
+                  {summaryOverdue.length > 0 && (
+                    <>
+                      <p className="summary-subhead">Overdue</p>
+                      <ul className="summary-list">
+                        {summaryOverdue.map((t) => renderSummaryTask(t, true))}
+                      </ul>
+                    </>
+                  )}
+                  {summaryDue.length > 0 && (
+                    <>
+                      {summaryOverdue.length > 0 && <p className="summary-subhead">Due</p>}
+                      <ul className="summary-list">
+                        {summaryDue.map((t) => renderSummaryTask(t, false))}
+                      </ul>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </section>
+    );
+  }
 
   // Renders a two-level grouped table — the outer level becomes section
   // headings, the inner level becomes the row-spanning left column. Which
@@ -553,6 +889,7 @@ export default function Home() {
         }}
       >
         <h3 style={{ marginBottom: 8 }}>{outerLabel}</h3>
+        <div className="table-scroll">
         <table style={{ borderCollapse: 'collapse', width: '100%' }}>
           <tbody>
             {innerGroupFn(outerTasks).map(([label, dateTasks]) =>
@@ -681,13 +1018,16 @@ export default function Home() {
             )}
           </tbody>
         </table>
+        </div>
       </div>
     ));
   }
 
   return (
-    <main style={{ padding: 40, paddingRight: 320 }}>
+    <main className="app-main">
       <h1>Tasks</h1>
+
+      {renderSummaryBox()}
 
       {webAssignIsStale && (
         <p
@@ -705,7 +1045,11 @@ export default function Home() {
         </p>
       )}
 
-      <div style={{ marginBottom: 20 }}>
+      <button className="add-toggle" onClick={() => setShowAddForm((v) => !v)}>
+        {showAddForm ? 'Close' : '+ Add task'}
+      </button>
+
+      <div className={`task-form${showAddForm ? ' open' : ''}`}>
         <input
           value={title}
           onChange={(e) => setTitle(e.target.value)}
@@ -736,50 +1080,35 @@ export default function Home() {
         </p>
       )}
 
-      <div style={{ marginBottom: 20 }}>
+      <div className="toolbar-row">
         <button
           onClick={() => setViewMode('table')}
           style={{ fontWeight: viewMode === 'table' ? 'bold' : 'normal' }}
         >
           Table view
-        </button>{' '}
+        </button>
         <button
           onClick={() => setViewMode('calendar')}
           style={{ fontWeight: viewMode === 'calendar' ? 'bold' : 'normal' }}
         >
           Calendar view
-        </button>{' '}
+        </button>
         <button
           onClick={() => setViewMode('completed')}
           style={{ fontWeight: viewMode === 'completed' ? 'bold' : 'normal' }}
         >
           Completed
-        </button>{' '}
-        <button onClick={openMappingPanel}>Manage subject names</button>{' '}
-        <label style={{ cursor: 'pointer', border: '1px solid #666', padding: '4px 8px', borderRadius: 4 }}>
-          Import WebAssign .ics
-          <input
-            type="file"
-            accept=".ics"
-            style={{ display: 'none' }}
-            onChange={(e) => {
-              const file = e.target.files?.[0];
-              if (file) importWebAssignFile(file);
-              e.target.value = ''; // allows re-selecting the same file later
-            }}
-          />
-        </label>
-        {webAssignStatus && <span style={{ marginLeft: 8, opacity: 0.8 }}>{webAssignStatus}</span>}
-        {' '}
+        </button>
+
         {viewMode !== 'calendar' && (
           <>
-            |{' '}
+            <span className="muted">|</span>
             <button
               onClick={() => setGroupMode('subject')}
               style={{ fontWeight: groupMode === 'subject' ? 'bold' : 'normal' }}
             >
               Group by subject
-            </button>{' '}
+            </button>
             <button
               onClick={() => setGroupMode('date')}
               style={{ fontWeight: groupMode === 'date' ? 'bold' : 'normal' }}
@@ -788,7 +1117,55 @@ export default function Home() {
             </button>
           </>
         )}
+
+        {viewMode === 'calendar' && (
+          <>
+            <span className="muted">|</span>
+            <button
+              onClick={() => setCalFilter('both')}
+              style={{ fontWeight: calFilter === 'both' ? 'bold' : 'normal' }}
+            >
+              Both
+            </button>
+            <button
+              onClick={() => setCalFilter('assignments')}
+              style={{ fontWeight: calFilter === 'assignments' ? 'bold' : 'normal' }}
+            >
+              Assignments
+            </button>
+            <button
+              onClick={() => setCalFilter('events')}
+              style={{ fontWeight: calFilter === 'events' ? 'bold' : 'normal' }}
+            >
+              Events
+            </button>
+            <span className="muted">blue = assignments, green = events</span>
+          </>
+        )}
       </div>
+
+      <details className="tools">
+        <summary>More tools</summary>
+        <div className="toolbar-row">
+          <button onClick={openMappingPanel}>Manage subject names</button>
+          <label className="file-button">
+            Import WebAssign .ics
+            <input
+              type="file"
+              accept=".ics"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                if (file) importWebAssignFile(file);
+                e.target.value = ''; // allows re-selecting the same file later
+              }}
+            />
+          </label>
+          <button onClick={syncGoogle}>Sync calendar</button>
+        </div>
+        {webAssignStatus && <p className="muted">{webAssignStatus}</p>}
+        {googleStatus && <p className="muted">{googleStatus}</p>}
+      </details>
 
       {showMappingPanel && (
         <div
@@ -806,7 +1183,7 @@ export default function Home() {
           </p>
           {rawSyncedCourses.length === 0 && <p>No synced tasks yet.</p>}
           {rawSyncedCourses.map((rawName) => (
-            <div key={rawName} style={{ display: 'flex', gap: 8, marginBottom: 8 }}>
+            <div key={rawName} style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
               <span style={{ opacity: 0.7, minWidth: 220 }}>{rawName}</span>
               <input
                 value={mappingDrafts[rawName] ?? ''}
@@ -854,7 +1231,15 @@ export default function Home() {
             view={calView}
             onNavigate={(newDate: Date) => setCalDate(newDate)}
             onView={(newView: string) => setCalView(newView as 'month' | 'week')}
-            onSelectEvent={(event: { resource: Task }) => openNotes(event.resource)}
+            onSelectEvent={(item: { kind: string; resource: Task }) => {
+              // Assignments open the notes panel; events are read-only.
+              if (item.kind === 'task') openNotes(item.resource);
+            }}
+            eventPropGetter={(item: { kind: string }) => ({
+              style: {
+                backgroundColor: item.kind === 'event' ? '#2e7d5b' : '#3174ad',
+              },
+            })}
             components={{
               // Native browser tooltip on hover — shows the full title
               // even when the event bar itself truncates it visually.
@@ -868,11 +1253,8 @@ export default function Home() {
 
       {notesTask && (
         <div
+          className="notes-panel"
           style={{
-            position: 'fixed',
-            top: 40,
-            right: 20,
-            width: 260,
             padding: 16,
             border: '1px solid #ccc',
             borderRadius: 8,

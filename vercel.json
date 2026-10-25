@@ -3,6 +3,10 @@
     {
       "path": "/api/sync-canvas",
       "schedule": "0 12 * * *"
+    },
+    {
+      "path": "/api/sync-google",
+      "schedule": "30 12 * * *"
     }
   ]
 }
