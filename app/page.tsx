@@ -46,6 +46,9 @@ const currentYear = new Date().getFullYear();
 const MIN_YEAR = currentYear - 1;
 const MAX_YEAR = currentYear + 5;
 
+// How old synced data may get before opening the app triggers a fresh sync.
+const SYNC_STALE_MS = 15 * 60 * 1000;
+
 const NO_SUBJECT = 'No subject';
 const NO_DATE = 'No due date';
 
@@ -202,6 +205,7 @@ export default function Home() {
   const [events, setEvents] = useState<EventRow[]>([]);
   const [lastGoogleSync, setLastGoogleSync] = useState<string | null>(null);
   const [googleStatus, setGoogleStatus] = useState('');
+  const [canvasStatus, setCanvasStatus] = useState('');
   const [calFilter, setCalFilter] = useState<'both' | 'assignments' | 'events'>('both');
 
   // null until the page is running in the browser, so the server-rendered
@@ -323,8 +327,43 @@ export default function Home() {
   // older than 15 minutes.
   async function maybeSyncGoogle() {
     const last = await fetchLastGoogleSync();
-    const stale = !last || Date.now() - new Date(last).getTime() > 15 * 60 * 1000;
+    const stale = !last || Date.now() - new Date(last).getTime() > SYNC_STALE_MS;
     if (stale) await syncGoogle();
+  }
+
+  async function syncCanvas() {
+    setCanvasStatus('Syncing Canvas…');
+    try {
+      const res = await fetch('/api/sync-canvas');
+      const json = await res.json().catch(() => null);
+
+      if (!res.ok || !json?.success) {
+        console.warn('Canvas sync failed:', json?.error ?? res.status);
+        setCanvasStatus('Canvas sync failed.');
+        return;
+      }
+
+      setCanvasStatus('');
+      await fetchTasks();
+    } catch (err) {
+      console.warn('Canvas sync threw:', err);
+      setCanvasStatus('Canvas sync failed.');
+    }
+  }
+
+  // Same idea as Google: the daily cron is only a backstop, so opening the
+  // app re-syncs Canvas whenever the last sync is older than the threshold.
+  async function maybeSyncCanvas() {
+    const { data, error } = await supabase
+      .from('app_settings')
+      .select('value')
+      .eq('key', 'last_canvas_sync')
+      .maybeSingle();
+
+    if (error) console.warn(error.message);
+    const last = data?.value ?? null;
+    const stale = !last || Date.now() - new Date(last).getTime() > SYNC_STALE_MS;
+    if (stale) await syncCanvas();
   }
 
   useEffect(() => {
@@ -333,6 +372,7 @@ export default function Home() {
     fetchLastWebAssignImport();
     fetchEvents();
     maybeSyncGoogle();
+    maybeSyncCanvas();
 
     setSummaryDate(startOfLocalDay(new Date()));
     try {
@@ -340,6 +380,19 @@ export default function Home() {
     } catch {
       // storage can be unavailable (private mode etc.) — default stays open
     }
+
+    // A phone browser keeps tabs alive for days, so "opening the app" often
+    // just means switching back to a tab that loaded long ago. Re-check
+    // whenever the tab becomes visible again.
+    function onVisible() {
+      if (document.visibilityState !== 'visible') return;
+      fetchTasks();
+      fetchEvents();
+      maybeSyncGoogle();
+      maybeSyncCanvas();
+    }
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
   }, []);
 
   function buildDueAtIso(
@@ -1162,9 +1215,11 @@ export default function Home() {
             />
           </label>
           <button onClick={syncGoogle}>Sync calendar</button>
+          <button onClick={syncCanvas}>Sync Canvas</button>
         </div>
         {webAssignStatus && <p className="muted">{webAssignStatus}</p>}
         {googleStatus && <p className="muted">{googleStatus}</p>}
+        {canvasStatus && <p className="muted">{canvasStatus}</p>}
       </details>
 
       {showMappingPanel && (

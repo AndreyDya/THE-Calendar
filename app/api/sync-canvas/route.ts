@@ -23,6 +23,14 @@ function parseSummary(summary: string): { title: string; course: string | null }
   return { title: summary.trim(), course: null };
 }
 
+// Recorded so the app can tell how fresh the data is when it opens, and
+// only re-sync when that's stale (see maybeSyncCanvas in page.tsx).
+async function recordSync() {
+  await supabaseAdmin
+    .from('app_settings')
+    .upsert({ key: 'last_canvas_sync', value: new Date().toISOString() }, { onConflict: 'key' });
+}
+
 export async function GET() {
   try {
     const data = (await ical.async.fromURL(CANVAS_ICS_URL)) as Record<string, IcsEvent>;
@@ -49,6 +57,7 @@ export async function GET() {
       });
 
     if (rows.length === 0) {
+      await recordSync();
       return Response.json({ success: true, upserted: 0 });
     }
 
@@ -60,6 +69,8 @@ export async function GET() {
       console.error('Canvas sync upsert failed:', error);
       return Response.json({ success: false, error: error.message }, { status: 500 });
     }
+
+    await recordSync();
 
     return Response.json({ success: true, upserted: count ?? rows.length });
   } catch (err) {
